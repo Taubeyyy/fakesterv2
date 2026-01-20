@@ -1,0 +1,5 @@
+{
+  "name": "Fakester Local",
+  "description": "A locally hosted version of the music quiz game Fakester, removing Supabase dependencies.",
+  "requestFramePermissions": []
+}
