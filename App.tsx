@@ -32,7 +32,8 @@ const AuthScreen = ({ onLogin, onGuest }: any) => {
     e.preventDefault();
     const endpoint = isRegister ? '/api/auth/register' : '/api/auth/login';
     try {
-      const res = await fetch(`http://localhost:8080${endpoint}`, {
+      // Relative URL nutzen, damit es auf taubey.com funktioniert
+      const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password })
@@ -49,15 +50,26 @@ const AuthScreen = ({ onLogin, onGuest }: any) => {
     }
   };
 
+  const handleSpotifyLogin = () => {
+      // Relative URL für den Login
+      window.location.href = '/login/spotify';
+  };
+
   return (
     <div className="flex flex-col items-center justify-center min-h-screen p-6 radial-bg">
       <h1 className="text-4xl font-extrabold tracking-widest text-accent mb-8">FAKESTER</h1>
       <div className="w-full max-w-md bg-surface p-8 rounded-2xl shadow-2xl">
         <h2 className="text-2xl font-bold mb-6 text-center">{isRegister ? 'Registrieren' : 'Anmelden'}</h2>
+        
+        {/* Spotify Login Button Highlighted */}
+        <Button onClick={handleSpotifyLogin} className="w-full mb-6 bg-[#1DB954] text-black hover:brightness-105">
+           <i className="fa-brands fa-spotify text-xl"></i> Mit Spotify anmelden
+        </Button>
+
         <form onSubmit={handleSubmit} className="flex flex-col gap-4">
           <Input placeholder="Benutzername" value={username} onChange={(e: any) => setUsername(e.target.value)} />
           <Input type="password" placeholder="Passwort" value={password} onChange={(e: any) => setPassword(e.target.value)} />
-          <Button type="submit">{isRegister ? 'Konto erstellen' : 'Anmelden'}</Button>
+          <Button type="submit" variant="secondary">{isRegister ? 'Konto erstellen' : 'Anmelden'}</Button>
         </form>
         <div className="mt-4 text-center text-sm text-gray-400">
           {isRegister ? 'Schon ein Konto?' : 'Noch kein Konto?'} 
@@ -70,7 +82,7 @@ const AuthScreen = ({ onLogin, onGuest }: any) => {
           <span className="px-4 text-xs">ODER</span>
           <div className="flex-1 border-b border-gray-700"></div>
         </div>
-        <Button variant="secondary" onClick={onGuest} className="w-full">
+        <Button variant="secondary" onClick={onGuest} className="w-full text-sm py-2">
           <i className="fa-solid fa-user-secret"></i> Als Gast spielen
         </Button>
       </div>
@@ -89,7 +101,8 @@ const HomeScreen = ({ user, onCreateGame, onJoinGame, onLogout }: any) => {
       <div className="flex-1 flex flex-col items-center gap-6 w-full max-w-md mx-auto">
         {/* Profile Card */}
         <div className="w-full bg-surface p-4 rounded-xl flex items-center gap-4">
-           <div className="w-16 h-16 rounded-full bg-gray-800 flex items-center justify-center text-2xl text-gray-500">
+           <div className="w-16 h-16 rounded-full bg-gray-800 flex items-center justify-center text-2xl text-gray-500 overflow-hidden">
+             {/* Use Spotify Avatar if available (not stored currently but ready structure) */}
              <i className="fa-solid fa-user"></i>
            </div>
            <div className="flex-1">
@@ -200,7 +213,7 @@ const App = () => {
 
   useEffect(() => {
     // Check for existing session on mount
-    fetch('http://localhost:8080/api/profile')
+    fetch('/api/profile')
       .then(res => res.json())
       .then(data => {
         if(data.id) setUser(data);
@@ -210,10 +223,14 @@ const App = () => {
 
   const connectWS = useCallback((currentUser: User) => {
     if(ws.current) return;
-    const socket = new WebSocket('ws://localhost:8080');
+    
+    // Automatisch Protokoll (ws oder wss) und Host erkennen
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = window.location.host; // Enthält taubey.com:3000
+    const socket = new WebSocket(`${protocol}//${host}`);
     
     socket.onopen = () => {
-      console.log('Connected to local WS');
+      console.log('Connected to WS');
     };
     
     socket.onmessage = (event) => {

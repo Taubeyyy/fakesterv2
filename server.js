@@ -4,34 +4,37 @@
  * Run with: node server.js
  */
 
+require('dotenv').config();
 const WebSocket = require('ws');
 const http = require('http');
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const cookieParser = require('cookie-parser');
-const axios = require('axios');
 const path = require('path');
+const querystring = require('querystring'); // HINZUGEFÜGT: Fix für Error Code
+const spotify = require('./spotify');
 
 const app = express();
 const server = http.createServer(app);
 
 // --- LOCAL DATABASE (In-Memory) ---
 const db = {
-    users: [], // { id, username, password, xp, spots, inventory: [] }
+    users: [], // { id, username, password, xp, spots, spotifyId, inventory: [] }
     sessions: new Map(), // token -> userId
     games: {}, // pin -> Game Object
 };
 
 // --- CONFIG ---
-const PORT = 8080;
-const CLIENT_ID = process.env.SPOTIFY_CLIENT_ID || 'dummy_client_id';
-const CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET || 'dummy_secret';
-const REDIRECT_URI = 'http://localhost:8080/callback';
+const PORT = process.env.PORT || 3000; // Geändert auf 3000 als Standard
 
 app.use(cors({ origin: true, credentials: true }));
 app.use(bodyParser.json());
 app.use(cookieParser());
+
+// --- STATIC FILES (Frontend Build) ---
+// Liefert die React App aus dem 'build' Ordner aus
+app.use(express.static(path.join(__dirname, 'build')));
 
 // --- AUTH HELPERS ---
 const generateToken = () => Math.random().toString(36).substring(2) + Date.now().toString(36);
@@ -42,7 +45,7 @@ const findUserByToken = (token) => {
 
 // --- API ROUTES ---
 
-// Login
+// Login (Lokal)
 app.post('/api/auth/login', (req, res) => {
     const { username, password } = req.body;
     const user = db.users.find(u => u.username === username && u.password === password);
@@ -53,21 +56,21 @@ app.post('/api/auth/login', (req, res) => {
         res.cookie('auth_token', token, { httpOnly: true });
         res.json({ success: true, user: { id: user.id, username: user.username, xp: user.xp, spots: user.spots } });
     } else {
-        res.status(401).json({ success: false, message: "Invalid credentials" });
+        res.status(401).json({ success: false, message: "Ungültige Anmeldedaten" });
     }
 });
 
-// Register
+// Register (Lokal)
 app.post('/api/auth/register', (req, res) => {
     const { username, password } = req.body;
     if (db.users.find(u => u.username === username)) {
-        return res.status(400).json({ success: false, message: "Username taken" });
+        return res.status(400).json({ success: false, message: "Benutzername vergeben" });
     }
     
     const newUser = {
         id: 'user-' + Date.now(),
         username,
-        password, // stored plain text for local demo
+        password, 
         xp: 0,
         spots: 100,
         inventory: []
@@ -84,7 +87,7 @@ app.post('/api/auth/register', (req, res) => {
 app.get('/api/profile', (req, res) => {
     const token = req.cookies.auth_token;
     const user = findUserByToken(token);
-    if (!user) return res.status(401).json({ message: "Unauthorized" });
+    if (!user) return res.status(401).json({ message: "Nicht angemeldet" });
     res.json(user);
 });
 
@@ -106,7 +109,6 @@ app.get('/api/shop/items', (req, res) => {
     res.json({ items });
 });
 
-// Buy Item
 app.post('/api/shop/buy', (req, res) => {
     const { itemId } = req.body;
     const token = req.cookies.auth_token;
@@ -124,18 +126,75 @@ app.post('/api/shop/buy', (req, res) => {
     res.json({ success: true, newSpots: user.spots });
 });
 
-// --- SPOTIFY PROXY (Simplified) ---
-// Note: In a real "local" environment without a registered Spotify App Callback, 
-// this part is tricky. Assuming the user has configured Client ID/Secret.
+// --- SPOTIFY AUTHENTICATION ---
 
 app.get('/login/spotify', (req, res) => {
-     const scopes = 'user-read-private user-read-email playlist-read-private streaming user-modify-playback-state user-read-playback-state';
-     res.redirect('https://accounts.spotify.com/authorize?' + new URLSearchParams({ response_type: 'code', client_id: CLIENT_ID, scope: scopes, redirect_uri: REDIRECT_URI }).toString());
+    const state = generateToken();
+    const authUrl = spotify.getAuthUrl(state);
+    res.redirect(authUrl);
 });
 
 app.get('/callback', async (req, res) => {
-    // This expects a real Spotify App Configured
-    res.redirect('http://localhost:3000'); // Redirect back to React Dev Server
+    const code = req.query.code || null;
+    const state = req.query.state || null;
+
+    if (code === null) {
+        return res.redirect('/#' + querystring.stringify({ error: 'state_mismatch' }));
+    }
+
+    try {
+        // 1. Token von Spotify holen
+        const data = await spotify.getToken(code);
+        const { access_token, refresh_token } = data;
+
+        // 2. Benutzerprofil laden
+        const profile = await spotify.getUserProfile(access_token);
+        
+        // 3. Benutzer in lokaler DB finden oder erstellen
+        let user = db.users.find(u => u.spotifyId === profile.id);
+
+        if (!user) {
+            // Wenn der User noch nicht existiert, erstellen wir ihn
+            user = {
+                id: 'sp-' + profile.id,
+                spotifyId: profile.id,
+                username: profile.display_name || profile.id,
+                xp: 0,
+                spots: 100,
+                inventory: [],
+                accessToken: access_token, 
+                refreshToken: refresh_token
+            };
+            db.users.push(user);
+        } else {
+            // Update Token für existierenden User
+            user.accessToken = access_token;
+            user.refreshToken = refresh_token;
+        }
+
+        // 4. Session erstellen
+        const token = generateToken();
+        db.sessions.set(token, user.id);
+        res.cookie('auth_token', token, { httpOnly: true });
+
+        // 5. Zurück zum Frontend
+        res.redirect('/'); 
+
+    } catch (error) {
+        console.error("Callback Error:", error);
+        res.redirect('/?error=spotify_login_failed');
+    }
+});
+
+// --- CLIENT ROUTING FALLBACK ---
+// Wichtig: Muss NACH den API Routes stehen.
+// Leitet alle unbekannten Anfragen an die React App weiter (für Client-Side Routing)
+app.get('*', (req, res) => {
+    // API Calls sollen 404 zurückgeben, wenn sie oben nicht gefunden wurden
+    if(req.path.startsWith('/api') || req.path.startsWith('/login') || req.path.startsWith('/callback')) {
+        return res.status(404).json({error: 'Not found'});
+    }
+    res.sendFile(path.join(__dirname, 'build', 'index.html'));
 });
 
 // --- WEBSOCKET SERVER ---
@@ -155,7 +214,6 @@ wss.on('connection', (ws) => {
     });
 });
 
-// Helper: Broadcast to lobby
 const broadcast = (pin, type, payload) => {
     const game = db.games[pin];
     if (!game) return;
@@ -228,7 +286,7 @@ function handleWSMessage(ws, data) {
         if (game && game.hostId === ws.userId) {
             game.gameState = 'PLAYING';
             broadcast(ws.pin, 'game-starting', {});
-            // Simulate game loop logic here (Countdown etc)
+            // Mock Loop
             setTimeout(() => {
                 broadcast(ws.pin, 'new-round', { round: 1, totalRounds: 10, mcOptions: { title: ['Song A', 'Song B', 'Song C'] } });
             }, 3000);
@@ -236,12 +294,11 @@ function handleWSMessage(ws, data) {
     }
     
     if (type === 'submit-guess') {
-         // Handle scoring locally
          const game = db.games[ws.pin];
          if(game) {
              const player = game.players.find(p => p.id === ws.userId);
              if(player) {
-                 player.score += 100; // Mock scoring
+                 player.score += 100;
                  player.isReady = true;
                  broadcast(ws.pin, 'player-reacted', { playerId: ws.userId, reaction: '✅' });
              }
@@ -250,5 +307,6 @@ function handleWSMessage(ws, data) {
 }
 
 server.listen(PORT, () => {
-    console.log(`Fakester Local Server running on port ${PORT}`);
+    console.log(`Fakester Server running on port ${PORT}`);
+    if(!process.env.SPOTIFY_CLIENT_ID) console.log("⚠️  WARNUNG: Keine Spotify Credentials in .env gefunden!");
 });
