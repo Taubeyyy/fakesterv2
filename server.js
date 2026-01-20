@@ -1,312 +1,304 @@
 /**
- * LOCAL SERVER IMPLEMENTATION
- * Removes Supabase and stores data in-memory variables.
- * Run with: node server.js
+ * FAKESTER SERVER (Production Ready)
+ * 
+ * Setup:
+ * 1. npm install
+ * 2. Erstelle .env Datei
+ * 3. npm run build (Erstellt das Frontend)
+ * 4. npm start (Startet den Server auf Port 3000)
  */
 
 require('dotenv').config();
-const WebSocket = require('ws');
-const http = require('http');
 const express = require('express');
-const cors = require('cors');
-const bodyParser = require('body-parser');
-const cookieParser = require('cookie-parser');
+const http = require('http');
+const WebSocket = require('ws');
 const path = require('path');
-const querystring = require('querystring'); // HINZUGEFÜGT: Fix für Error Code
+const cookieParser = require('cookie-parser');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const fs = require('fs'); // Wichtig für Datei-Speicherung
 const spotify = require('./spotify');
 
 const app = express();
 const server = http.createServer(app);
+const PORT = process.env.PORT || 3000;
+const DB_FILE = path.join(__dirname, 'database.json');
 
-// --- LOCAL DATABASE (In-Memory) ---
-const db = {
-    users: [], // { id, username, password, xp, spots, spotifyId, inventory: [] }
-    sessions: new Map(), // token -> userId
-    games: {}, // pin -> Game Object
-};
-
-// --- CONFIG ---
-const PORT = process.env.PORT || 3000; // Geändert auf 3000 als Standard
-
-app.use(cors({ origin: true, credentials: true }));
+// --- MIDDLEWARE ---
+app.use(cors()); 
 app.use(bodyParser.json());
 app.use(cookieParser());
 
-// --- STATIC FILES (Frontend Build) ---
-// Liefert die React App aus dem 'build' Ordner aus
-app.use(express.static(path.join(__dirname, 'build')));
+// --- DATABASE & PERSISTENCE ---
+const db = {
+    users: [],      // User Store (Persistent)
+    sessions: new Map(), // Token -> UserId (RAM only)
+    games: {}       // Active Games (RAM only)
+};
 
-// --- AUTH HELPERS ---
-const generateToken = () => Math.random().toString(36).substring(2) + Date.now().toString(36);
-const findUserByToken = (token) => {
+// Laden der Datenbank beim Start
+function loadDB() {
+    try {
+        if (fs.existsSync(DB_FILE)) {
+            const raw = fs.readFileSync(DB_FILE, 'utf8');
+            const data = JSON.parse(raw);
+            if (Array.isArray(data.users)) {
+                db.users = data.users;
+                console.log(`💾 Datenbank geladen: ${db.users.length} Benutzer wiederhergestellt.`);
+            }
+        } else {
+            // Erstelle leere Datei wenn nicht vorhanden
+            saveDB(); 
+        }
+    } catch (e) {
+        console.error("❌ Fehler beim Laden der Datenbank:", e);
+    }
+}
+
+// Speichern der Datenbank
+function saveDB() {
+    try {
+        // Wir speichern nur die User-Daten dauerhaft. 
+        // Sessions und laufende Spiele sind temporär.
+        const data = {
+            users: db.users,
+            lastSaved: new Date().toISOString()
+        };
+        fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+    } catch (e) {
+        console.error("❌ Fehler beim Speichern der Datenbank:", e);
+    }
+}
+
+// Datenbank initial laden
+loadDB();
+
+// --- AUTH UTILS ---
+const generateId = () => Math.random().toString(36).substr(2, 9);
+const generateToken = () => generateId() + Date.now().toString(36);
+
+const getSessionUser = (req) => {
+    const token = req.cookies.auth_token;
+    if (!token) return null;
     const userId = db.sessions.get(token);
-    return db.users.find(u => u.id === userId);
+    return db.users.find(u => u.id === userId) || null;
 };
 
 // --- API ROUTES ---
 
-// Login (Lokal)
-app.post('/api/auth/login', (req, res) => {
-    const { username, password } = req.body;
-    const user = db.users.find(u => u.username === username && u.password === password);
-    
-    if (user) {
-        const token = generateToken();
-        db.sessions.set(token, user.id);
-        res.cookie('auth_token', token, { httpOnly: true });
-        res.json({ success: true, user: { id: user.id, username: user.username, xp: user.xp, spots: user.spots } });
-    } else {
-        res.status(401).json({ success: false, message: "Ungültige Anmeldedaten" });
-    }
-});
-
-// Register (Lokal)
-app.post('/api/auth/register', (req, res) => {
-    const { username, password } = req.body;
-    if (db.users.find(u => u.username === username)) {
-        return res.status(400).json({ success: false, message: "Benutzername vergeben" });
-    }
-    
-    const newUser = {
-        id: 'user-' + Date.now(),
-        username,
-        password, 
-        xp: 0,
-        spots: 100,
-        inventory: []
-    };
-    
-    db.users.push(newUser);
-    const token = generateToken();
-    db.sessions.set(token, newUser.id);
-    res.cookie('auth_token', token, { httpOnly: true });
-    res.json({ success: true, user: { id: newUser.id, username: newUser.username, xp: newUser.xp, spots: newUser.spots } });
-});
-
-// Get Profile
+// 1. Profile / Session Check
 app.get('/api/profile', (req, res) => {
-    const token = req.cookies.auth_token;
-    const user = findUserByToken(token);
-    if (!user) return res.status(401).json({ message: "Nicht angemeldet" });
+    const user = getSessionUser(req);
+    if (!user) return res.status(401).json({ error: 'Unauthorized' });
     res.json(user);
 });
 
-// Mock Shop Items
-const SHOP_ITEMS = [
-    { id: 1, name: "Gold Title", cost: 100, type: 'title' },
-    { id: 2, name: "Cool Icon", cost: 50, type: 'icon', iconClass: 'fa-user-astronaut' }
-];
-
-app.get('/api/shop/items', (req, res) => {
-    const token = req.cookies.auth_token;
-    const user = findUserByToken(token);
-    if (!user) return res.status(401).json({ message: "Unauthorized" });
+// 2. Guest Login
+app.post('/api/auth/guest', (req, res) => {
+    const guestUser = {
+        id: 'guest-' + generateId(),
+        username: `Gast ${Math.floor(Math.random() * 1000)}`,
+        xp: 0,
+        spots: 0,
+        isGuest: true,
+        avatar: null,
+        createdAt: new Date()
+    };
+    db.users.push(guestUser);
+    saveDB(); // SPEICHERN
     
-    const items = SHOP_ITEMS.map(item => ({
-        ...item,
-        isOwned: user.inventory.includes(item.id)
-    }));
-    res.json({ items });
+    const token = generateToken();
+    db.sessions.set(token, guestUser.id);
+    
+    res.cookie('auth_token', token, { httpOnly: true, maxAge: 24 * 60 * 60 * 1000 });
+    res.json({ success: true, user: guestUser });
 });
 
-app.post('/api/shop/buy', (req, res) => {
-    const { itemId } = req.body;
-    const token = req.cookies.auth_token;
-    const user = findUserByToken(token);
-    if (!user) return res.status(401).json({ message: "Unauthorized" });
-    
-    const item = SHOP_ITEMS.find(i => i.id === itemId);
-    if (!item) return res.status(404).json({ message: "Item not found" });
-    
-    if (user.spots < item.cost) return res.status(400).json({ message: "Not enough spots" });
-    
-    user.spots -= item.cost;
-    user.inventory.push(item.id);
-    
-    res.json({ success: true, newSpots: user.spots });
-});
-
-// --- SPOTIFY AUTHENTICATION ---
-
+// 3. Spotify Login Redirect
 app.get('/login/spotify', (req, res) => {
     const state = generateToken();
-    const authUrl = spotify.getAuthUrl(state);
-    res.redirect(authUrl);
+    res.redirect(spotify.getAuthUrl(state));
 });
 
+// 4. Spotify Callback
 app.get('/callback', async (req, res) => {
     const code = req.query.code || null;
-    const state = req.query.state || null;
-
-    if (code === null) {
-        return res.redirect('/#' + querystring.stringify({ error: 'state_mismatch' }));
-    }
+    if (!code) return res.redirect('/?error=no_code');
 
     try {
-        // 1. Token von Spotify holen
-        const data = await spotify.getToken(code);
-        const { access_token, refresh_token } = data;
-
-        // 2. Benutzerprofil laden
-        const profile = await spotify.getUserProfile(access_token);
+        const tokens = await spotify.getToken(code);
+        const profile = await spotify.getUserProfile(tokens.access_token);
         
-        // 3. Benutzer in lokaler DB finden oder erstellen
         let user = db.users.find(u => u.spotifyId === profile.id);
-
+        
         if (!user) {
-            // Wenn der User noch nicht existiert, erstellen wir ihn
             user = {
                 id: 'sp-' + profile.id,
                 spotifyId: profile.id,
                 username: profile.display_name || profile.id,
+                email: profile.email,
+                avatar: profile.images?.[0]?.url,
                 xp: 0,
                 spots: 100,
-                inventory: [],
-                accessToken: access_token, 
-                refreshToken: refresh_token
+                isGuest: false,
+                accessToken: tokens.access_token,
+                refreshToken: tokens.refresh_token,
+                createdAt: new Date()
             };
             db.users.push(user);
         } else {
-            // Update Token für existierenden User
-            user.accessToken = access_token;
-            user.refreshToken = refresh_token;
+            user.accessToken = tokens.access_token;
+            user.refreshToken = tokens.refresh_token;
+            // Update Avatar if changed
+            if(profile.images?.[0]?.url) user.avatar = profile.images[0].url;
+            user.lastLogin = new Date();
         }
+        
+        saveDB(); // SPEICHERN
 
-        // 4. Session erstellen
         const token = generateToken();
         db.sessions.set(token, user.id);
         res.cookie('auth_token', token, { httpOnly: true });
-
-        // 5. Zurück zum Frontend
-        res.redirect('/'); 
-
-    } catch (error) {
-        console.error("Callback Error:", error);
-        res.redirect('/?error=spotify_login_failed');
+        res.redirect('/');
+        
+    } catch (err) {
+        console.error('Spotify Auth Failed:', err);
+        res.redirect('/?error=spotify_failed');
     }
-});
-
-// --- CLIENT ROUTING FALLBACK ---
-// Wichtig: Muss NACH den API Routes stehen.
-// Leitet alle unbekannten Anfragen an die React App weiter (für Client-Side Routing)
-app.get('*', (req, res) => {
-    // API Calls sollen 404 zurückgeben, wenn sie oben nicht gefunden wurden
-    if(req.path.startsWith('/api') || req.path.startsWith('/login') || req.path.startsWith('/callback')) {
-        return res.status(404).json({error: 'Not found'});
-    }
-    res.sendFile(path.join(__dirname, 'build', 'index.html'));
 });
 
 // --- WEBSOCKET SERVER ---
 const wss = new WebSocket.Server({ server });
 
-wss.on('connection', (ws) => {
-    ws.isAlive = true;
-    ws.on('pong', () => ws.isAlive = true);
-
-    ws.on('message', (message) => {
-        try {
-            const data = JSON.parse(message);
-            handleWSMessage(ws, data);
-        } catch (e) {
-            console.error("WS Parse Error", e);
-        }
-    });
-});
-
-const broadcast = (pin, type, payload) => {
+const broadcastLobby = (pin) => {
     const game = db.games[pin];
     if (!game) return;
+    
+    const payload = JSON.stringify({
+        type: 'LOBBY_UPDATE',
+        payload: {
+            pin,
+            hostId: game.hostId,
+            players: game.players,
+            gameState: game.gameState
+        }
+    });
+
     game.clients.forEach(client => {
         if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({ type, payload }));
+            client.send(payload);
         }
     });
 };
 
-function handleWSMessage(ws, data) {
-    const { type, payload } = data;
-    
-    if (type === 'create-game') {
-        const pin = Math.floor(1000 + Math.random() * 9000).toString();
-        db.games[pin] = {
-            pin,
-            hostId: payload.user.id,
-            players: [{
-                ...payload.user,
-                score: 0,
-                isReady: false,
-                isConnected: true
-            }],
-            settings: payload.settings || {},
-            gameMode: payload.gameMode,
-            gameState: 'LOBBY',
-            clients: [ws]
-        };
-        ws.pin = pin;
-        ws.userId = payload.user.id;
-        
-        ws.send(JSON.stringify({ 
-            type: 'lobby-update', 
-            payload: { 
-                pin, 
-                hostId: payload.user.id, 
-                players: db.games[pin].players,
-                settings: db.games[pin].settings,
-                gameMode: payload.gameMode 
-            } 
-        }));
-    }
-    
-    if (type === 'join-game') {
-        const game = db.games[payload.pin];
-        if (game) {
-            game.players.push({
-                ...payload.user,
-                score: 0,
-                isReady: false,
-                isConnected: true
-            });
-            game.clients.push(ws);
-            ws.pin = payload.pin;
-            ws.userId = payload.user.id;
-            
-            broadcast(payload.pin, 'lobby-update', {
-                pin: payload.pin,
-                hostId: game.hostId,
-                players: game.players,
-                settings: game.settings,
-                gameMode: game.gameMode
-            });
-        }
-    }
-    
-    if (type === 'start-game') {
-        const game = db.games[ws.pin];
-        if (game && game.hostId === ws.userId) {
-            game.gameState = 'PLAYING';
-            broadcast(ws.pin, 'game-starting', {});
-            // Mock Loop
-            setTimeout(() => {
-                broadcast(ws.pin, 'new-round', { round: 1, totalRounds: 10, mcOptions: { title: ['Song A', 'Song B', 'Song C'] } });
-            }, 3000);
-        }
-    }
-    
-    if (type === 'submit-guess') {
-         const game = db.games[ws.pin];
-         if(game) {
-             const player = game.players.find(p => p.id === ws.userId);
-             if(player) {
-                 player.score += 100;
-                 player.isReady = true;
-                 broadcast(ws.pin, 'player-reacted', { playerId: ws.userId, reaction: '✅' });
-             }
-         }
-    }
-}
+wss.on('connection', (ws, req) => {
+    // Parse Cookie from WS Request to identify user
+    const cookieString = req.headers.cookie || '';
+    const tokenMatch = cookieString.match(/auth_token=([^;]+)/);
+    const token = tokenMatch ? tokenMatch[1] : null;
+    const userId = db.sessions.get(token);
+    const user = db.users.find(u => u.id === userId);
 
+    if (!user) {
+        ws.close();
+        return;
+    }
+
+    ws.userId = user.id;
+
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message);
+            
+            // Create Game
+            if (data.type === 'CREATE_GAME') {
+                const pin = Math.floor(100000 + Math.random() * 900000).toString(); // 6 Digit PIN
+                db.games[pin] = {
+                    pin,
+                    hostId: user.id,
+                    gameState: 'LOBBY',
+                    players: [{ ...user, score: 0, connected: true }],
+                    clients: [ws]
+                };
+                ws.pin = pin;
+                broadcastLobby(pin);
+            }
+
+            // Join Game
+            if (data.type === 'JOIN_GAME') {
+                const { pin } = data.payload;
+                const game = db.games[pin];
+                if (game && game.gameState === 'LOBBY') {
+                    // Prevent duplicate join
+                    if (!game.players.find(p => p.id === user.id)) {
+                        game.players.push({ ...user, score: 0, connected: true });
+                    }
+                    game.clients.push(ws);
+                    ws.pin = pin;
+                    broadcastLobby(pin);
+                } else {
+                    ws.send(JSON.stringify({ type: 'ERROR', payload: 'Raum nicht gefunden oder Spiel läuft bereits.' }));
+                }
+            }
+
+            // Start Game
+            if (data.type === 'START_GAME') {
+                const game = db.games[ws.pin];
+                if (game && game.hostId === ws.userId) {
+                    game.gameState = 'PLAYING';
+                    broadcastLobby(ws.pin);
+                    
+                    // Simple Mock Game Loop
+                    setTimeout(() => {
+                         game.clients.forEach(c => {
+                             if(c.readyState === WebSocket.OPEN) {
+                                 c.send(JSON.stringify({ type: 'GAME_EVENT', payload: { message: 'Spiel startet! (Mock)' }}));
+                             }
+                         });
+                    }, 1000);
+                }
+            }
+            
+            // Example: Wenn ein Spiel endet und XP verteilt werden
+            // Müsste man hier auch saveDB() aufrufen!
+
+        } catch (e) {
+            console.error('WS Error', e);
+        }
+    });
+
+    ws.on('close', () => {
+        if (ws.pin && db.games[ws.pin]) {
+            const game = db.games[ws.pin];
+            const player = game.players.find(p => p.id === ws.userId);
+            if (player) player.connected = false;
+            // Clean up clients array
+            game.clients = game.clients.filter(c => c !== ws);
+            broadcastLobby(ws.pin);
+            
+            // Delete empty games after timeout
+            if (game.clients.length === 0) {
+                setTimeout(() => {
+                    if (game.clients.length === 0) delete db.games[ws.pin];
+                }, 30000); // 30s grace period
+            }
+        }
+    });
+});
+
+// --- STATIC FILES (Frontend) ---
+app.use(express.static(path.join(__dirname, 'dist')));
+
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+});
+
+// --- START ---
 server.listen(PORT, () => {
-    console.log(`Fakester Server running on port ${PORT}`);
-    if(!process.env.SPOTIFY_CLIENT_ID) console.log("⚠️  WARNUNG: Keine Spotify Credentials in .env gefunden!");
+    console.log(`
+    🚀 Fakester Server läuft!
+    -------------------------
+    URL:        http://taubey.com:${PORT}
+    DB Status:  ${db.users.length} User geladen.
+    `);
 });
